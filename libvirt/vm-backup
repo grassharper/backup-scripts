@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+#
+# Author: Andrei Buzoianu <andrei@buzoianu.info>
+# 2019-04-10 Version 0.1
+#
+
+# backup UID
+USER=backup
+
+# backup GID
+GROUP=backup
+
+# State file location
+STATEDIR=/tmp
+
+# Prefix for mysqldump program
+VIRSH_PREFIX=/bin
+
+# The DATE-parameter tells date in format YYYY.MM.DD.
+DATE=`date +20%y.%m.%d`
+
+# The TIME-parameter tells time in format HHMMSS.
+TIME=`date +%H%M%S`
+
+# Arguments
+if [ $# -ne 3 ]; then
+    echo "Usage: ./vm-backup <backup-folder> <domain> <host>"
+    exit 1
+fi
+
+BACKUPDIR="$1"
+DOMAIN="$2"
+HOST="$3"
+
+case "$HOST" in
+    "localhost"|"127.0.0.1")
+        LOCAL=true
+        VIRSH_URI="qemu:///system"
+        ;;
+
+    *)
+        LOCAL=false
+        VIRSH_URI="qemu+ssh://$USER@$HOST/system"
+esac
+
+#
+# Test if QEMU guest agent is connected
+# 
+$VIRSH_PREFIX/virsh -c "$VIRSH_URI" qemu-agent-command "$DOMAIN" '{"execute":"guest-ping"}' > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    echo "Guest agent is not responding!"
+    echo
+    USE_QEMU_AGENT=false
+else
+    USE_QEMU_AGENT=true
+fi
+
+#
+# Start the backup
+#
+echo "Beginning backup for $DOMAIN"
+echo
+echo "Starting backup of VM $DOMAIN to $BACKUPDIR/$DOMAIN/$DATE.$TIME"
+
+if [ ! -f "$VIRSH_PREFIX/virsh" ]
+    then
+        echo "ERROR Couldn\'t locate the virsh command under $VIRSH_PREFIX"
+        exit 1
+fi
+
+if [ ! -d "$BACKUPDIR" ]
+    then
+        echo "Creating backup directory $BACKUPDIR"
+        mkdir -p $BACKUPDIR
+fi
+
+if [ ! -d "$BACKUPDIR/$DOMAIN/$DATE.$TIME" ]
+    then
+        echo "Creating backup subdirectories $BACKUPDIR/$DOMAIN/$DATE.$TIME"
+        mkdir -p $BACKUPDIR/$DOMAIN/$DATE.$TIME
+fi
+
+#
+# Get the list of targets (disks) and the image paths
+#
+declare -A disks
+eval $("$VIRSH_PREFIX"/virsh -c "$VIRSH_URI" domblklist "$DOMAIN" --details | awk '/^[[:space:]]*file[[:space:]]+disk/ {print "disks["$3"]="$4}')
+
+#
+# Create the snapshot
+# 
+if [ "$USE_QEMU_AGENT" = true ]
+    then
+        #
+        # If dynamic_ownership is set to 0 in qemu.conf (Opennebula does that by default), we need to touch the snapshot file before creating the external snapshot, 
+        # and chown it to user and group defined in qemu.conf. Known workaround for https://bugzilla.redhat.com/show_bug.cgi?id=1363634
+        #
+        for disk in ${!disks[@]}; do
+            if [[ -f "${disks[$disk]}.backup" ]]; then
+                echo "${disks[$disk]}.backup from $DOMAIN already exists"
+                exit 1
+            fi
+            touch "${disks[$disk]}.backup"
+            chown $USER:$GROUP "${disks[$disk]}.backup"
+        done
+
+        DISKSPEC=""
+        for disk in ${!disks[@]}; do
+            DISKSPEC="$DISKSPEC --diskspec $disk,snapshot=external,file=${disks[$disk]}.backup"
+        done
+        $VIRSH_PREFIX/virsh -c "$VIRSH_URI" snapshot-create-as --domain "$DOMAIN" --disk-only --atomic --no-metadata --quiesce $DISKSPEC > /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            echo "Failed to create snapshot for $DOMAIN"
+            exit 1
+        fi
+
+        #
+        # Copy disk images
+        #
+        for disk in ${!disks[@]}; do
+            NAME=$(basename "${disks[$disk]}")
+            rsync -ah --progress ${disks[$disk]} $BACKUPDIR/$DOMAIN/$DATE.$TIME/$NAME
+        done
+        
+        #
+        # Merge changes back
+        #
+        for disk in ${!disks[@]}; do
+            $VIRSH_PREFIX/virsh -c "$VIRSH_URI" blockcommit "$DOMAIN" "${disks[$disk]}.backup" --active --wait --pivot > /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                echo "Could not merge changes for disk ${disks[$disk]} of $DOMAIN. VM may be in invalid state."
+                exit 1
+            fi
+        done
+
+        #
+        # Cleanup left over backup images
+        #
+        for disk in ${!disks[@]}; do
+            rm -f "${disks[$disk]}.backup"
+        done
+
+    else
+        $VIRSH_PREFIX/virsh -c "$VIRSH_URI" save "$DOMAIN" $STATEDIR/$DOMAIN-$DATE-$TIME-state-file > /dev/null 2>&1
+
+        #
+        # Copy disk images
+        #
+        for disk in ${!disks[@]}; do
+            NAME=$(basename "${disks[$disk]}")
+            rsync -ah --progress ${disks[$disk]} $BACKUPDIR/$DOMAIN/$DATE.$TIME/$NAME
+        done
+        
+        $VIRSH_PREFIX/virsh -c "$VIRSH_URI" restore $STATEDIR/$DOMAIN-$DATE-$TIME-state-file > /dev/null 2>&1
+
+        #
+        # Cleanup left over state-files
+        #
+        if [ "$LOCAL" = true ]
+            then
+                rm -rf $STATEDIR/$DOMAIN-$DATE-$TIME-state-file
+            else
+	        ssh -q $USER@$HOST "rm -rf $STATEDIR/$DOMAIN-$DATE-$TIME-state-file"
+        fi
+fi
+
+#
+# Dump the configuration information
+#
+$VIRSH_PREFIX/virsh -c "$VIRSH_URI" dumpxml "$DOMAIN" >"$BACKUPDIR/$DOMAIN/$DATE.$TIME/$DOMAIN.xml" > /dev/null 2>&1
+chown $USER:$GROUP "$BACKUPDIR/$DOMAIN/$DATE.$TIME/$DOMAIN.xml"
+
+echo "Finished backup"
+echo
