@@ -7,13 +7,15 @@ vm-backup can be used to make offline or online backups of libvirt/KVM virtual m
 $ /opt/bin/vm-backup 
 Usage: ./vm-backup <backup-folder> <domain> <host>
 ```
-Options
-<backup-folder>	Copy images to the specified <directory>
-<domain>	Name of the instace to backup
-<host>		Can be localhost|127.0.0.1 or FQDN
-
-Example:
 ```
+Options:
+    <backup-folder> Copy images to the specified <directory>
+    <domain>        Name of the instace to backup
+    <host>          Can be localhost|127.0.0.1 or FQDN
+```
+
+```
+Example:
 $ /opt/bin/vm-backup /backup myvm myhost
 Beginning backup for myvm
 
